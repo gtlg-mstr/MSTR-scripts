@@ -45,8 +45,8 @@ import getpass #Optional
 ## comment this out and uncomment the other password if you want to set it to a standard password.
 ## Note: Authentication is standard or LDAP only for this approach.
 #
-base_url = 'https://env-324395.customer.cloud.microstrategy.com/MicroStrategyLibrary/'
-username = 'glagrange'
+base_url = 'https://env-<ENV ID>.customer.cloud.microstrategy.com/MicroStrategyLibrary/'
+username = '<YOUR USERNAME>'
 password = getpass.getpass(prompt='Password ')
 #password = 'YOUR PASSWORD'
 project_name = 'MicroStrategy Tutorial'
