@@ -1,9 +1,4 @@
 # MSTR-scripts
-
-231119 - Added license audit script for < 11.3.11
-
-
-Collection of Python based scripts for doing functions on MicroStrategy
-
-* MSTR_usergmgmt.py - Script to show basic functions of creating users and groups in MicroStrategy using the RESTFUL API
+20241022 - Moved older scripts to Archives
+        Added E03 which is an example of how to call and answer prompted reports. The output is to review the data and SQL generated
 
