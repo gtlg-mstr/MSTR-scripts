@@ -80,7 +80,7 @@ format_string = "%Y-%m-%d %H:%M:%S"
 x = datetime.now()
 print(x.strftime(format_string))
 gmail.user_name = 'glagrange@gmail.com'
-gmail.password = 'yleicbitwkadwrpy'
+gmail.password = ''
 
 # Let Red Mail to render the dataframe for you:
 gmail.use_jinja = False
