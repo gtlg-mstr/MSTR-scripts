@@ -1,9 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
-
-
 '''
 STEPS to Export:
 1. Connect to Libary
@@ -26,8 +23,8 @@ import base64
 ##Variables list
 #base_url can only connect to Library
 #login mode is in the connection variable
-base_url = "https://tutorial.microstrategy.com/MicroStrategyLibraryInsights/"
-username = "glagrange"
+base_url = "https://<SERVER>/MicroStrategyLibraryInsights/"
+username = "<USER>"
 password = open('variable.txt').read().strip()
 
 #Change it to a new value -- MUST BE CHANGED
@@ -85,10 +82,6 @@ def doc_instance_export(conn, DocId, doc_inst_id, filename=f"output/{filename}.p
         print("Error:", res.status_code, res.text)
         return None
 
-
-# In[2]:
-
-
 '''Step1 - Connect to Library'''
 conn = Connection(base_url, username, password,login_mode=16, project_name=project_name)
 
@@ -135,9 +128,6 @@ for f in filters:
     filter_source_id = f['source_id']
     filter_id = f['filter_id']
     filter_name= f['filter_name']
-
-
-# In[3]:
 
 
 '''Step3 - Create Document/Dashboard instance'''
@@ -187,4 +177,3 @@ print('')
 doc_export=doc_instance_export(conn,obj_id,doc, filename)
 
 conn.close()
-
