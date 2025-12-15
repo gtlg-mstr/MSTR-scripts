@@ -1,9 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
-
-
 from mstrio.connection import Connection
 from mstrio.project_objects.document import (
     Document, list_documents, list_documents_across_projects
@@ -13,8 +10,8 @@ import json
 import base64
 #base_url can only connect to Library
 #login mode is in the connection variable
-base_url = "https://tutorial.microstrategy.com/MicroStrategyLibraryInsights/"
-username = "glagrange"
+base_url = "https://<SERVER>/MicroStrategyLibraryInsights/"
+username = "<USER>"
 password = open('variable.txt').read().strip()
 
 #Change it to a new value if need be
@@ -70,20 +67,12 @@ def doc_instance_export(conn, DocId, doc_inst_id, filename=f"output/{filename}.p
         return None
 
 
-# In[2]:
-
-
 print(f'Document ID:{doc_id}')
 
 doc=doc_instance(conn,doc_id)
 print(f'Document Instance ID: {doc}')
 
 doc_export=doc_instance_export(conn,doc_id,doc)
-
-
-
-# In[3]:
-
 
 conn.close()
 
