@@ -1,9 +1,5 @@
 #!/usr/bin/env python
 # coding: utf-8
-
-# In[4]:
-
-
 '''
 *** TESTED ON Strategy ONE (Sept 2025) ***
 
@@ -204,10 +200,3 @@ pdfsettings={
 doc_export=doc_instance_export(conn,obj_id,doc, pdfsettings,filename)
 
 conn.close()
-
-
-# In[ ]:
-
-
-
-
