@@ -1,0 +1,17 @@
+# --------------------------
+# READ POSTGRES CONNECTION STRING FROM TEXT FILE
+# --------------------------
+# pg_conn.txt content example:
+# postgresql+psycopg2://user:password@localhost:5432/allstate_db
+PG_CONN_FILE = "pg_df.txt"
+
+if not os.path.exists(PG_CONN_FILE):
+    raise FileNotFoundError(
+        f"Connection file '{PG_CONN_FILE}' not found. "
+        "Create it with your PostgreSQL connection string on a single line."
+    )
+
+with open(PG_CONN_FILE, "r", encoding="utf-8") as f:
+    PG_CONN_STR = f.read().strip()
+
+engine = create_engine(PG_CONN_STR)
