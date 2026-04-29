@@ -1,4 +1,30 @@
+# Env / secrets
+.env
+.env.*
 
+# HAR captures (network logs with auth tokens)
+har-captures/
+
+# Archive folder
+archive/
+
+# Generated diagrams/images
+*.png
+*.mmd
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Config (may contain credentials)
+config.yaml
+
+# AI/agent local config
+.claude/
+.codex
+.playwright-mcp/
+
+# Legacy uploads
 MuploadJSON/MSTRCDFJ.py
 MuploadJSON/MSTRCDFJv1.py
 MuploadJSON/MuploadJSON.zip
