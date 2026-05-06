@@ -1,34 +1,36 @@
+#!/usr/bin/env python3
 """
 MicroStrategy Data Dictionary Generator
 =======================================
-Connects to MicroStrategy, extracts Mosaic model metadata, compares it
-against actual data source tables, and outputs a side-by-side CSV dictionary.
-
-Settings are loaded from:
-  - .env          (credentials: URL, username, password, project)
-  - config.yaml   (application settings: models, output path)
+Compares a Mosaic model against its actual data source tables,
+outputting a side-by-side CSV with MATCH / TYPE_MISMATCH / IN_MOSAIC_ONLY / IN_PHYSICAL_ONLY.
 
 Usage:
-    python mstr_data_dictionary.py
+    # Compare a model (auto-discovers datasources from pipeline metadata)
+    python 04_mstr_data_dictionary.py \\
+        --model-id D9F9D6AF8512455F813A58F150FD56BB
+
+    # Specify datasource name + table for physical queries (recommended)
+    python 04_mstr_data_dictionary.py \\
+        --model-id D9F9D6AF8512455F813A58F150FD56BB \\
+        --datasource "glagrange - Postgresql" --table LRX_pg_orders --schema public \\
+        --datasource "glagrange - MicroSoft SQL" --table LRX_mssql_rx --schema dbo
+
+    # Custom output
+    python 04_mstr_data_dictionary.py --model-id <ID> --output my_dict.csv
 """
-# Tested on Strategy One April 2026 release.
 
-
+import argparse
 import csv
+import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 from mstrio import connection
-from mstrio.modeling import (
-    list_namespaces,
-    list_datasource_warehouse_tables,
-    list_physical_tables,
-    list_logical_tables,
-)
-from mstrio.datasources import list_connected_datasource_instances
+from mstrio.datasources import DatasourceInstance
 
-# Load .env if python-dotenv is installed
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -44,109 +46,31 @@ def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
 
-def _load_yaml_config() -> dict[str, Any]:
-    config_path = Path(__file__).parent / "config.yaml"
-    if config_path.exists():
-        import yaml
-        return yaml.safe_load(config_path.read_text())
-    return {}
-
-
-def _get_model_to_ds_map(conn: connection.Connection, model_names: list[str]) -> dict[str, str]:
-    """Map model names from config to their MicroStrategy datasource IDs."""
-    print("Mapping models to datasource IDs...")
-    ds_list = list_connected_datasource_instances(conn, to_dictionary=True)
-
-    print(f"  DEBUG: Available Datasources: {[ds.get('name') for ds in ds_list]}")
-
-    model_upper = [m.upper() for m in model_names]
-
-    mapping = {}
-    for ds in ds_list:
-        name = ds.get("name", "").upper()
-        if name in model_upper:
-            mapping[name] = ds["id"]
-            print(f"  Found: {ds.get('name')} -> {ds['id']}")
-
-    return mapping
-
-
-# ---------------------------------------------------------------------------
-# Load settings
-# ---------------------------------------------------------------------------
-
-# --- MicroStrategy credentials (from .env) ---
-MSTR_BASE_URL = _env("MSTR_BASE_URL", "https://your-env.microstrategy.com/MicroStrategyLibrary")
-MSTR_USERNAME = _env("MSTR_USERNAME", "your_username")
-MSTR_PASSWORD = _env("MSTR_PASSWORD", "your_password")
-MSTR_PROJECT_NAME = _env("MSTR_PROJECT_NAME", "your_project_name")
-MSTR_LOGIN_MODE = int(_env("MSTR_LOGIN_MODE", "1"))
-
-# --- Application settings (from config.yaml) ---
-_config = _load_yaml_config()
-_mstr_section = _config.get("mstr", {})
-MOSAIC_MODELS = _config.get("mosaic_models", _mstr_section.get("mosaic_models", []))
-OUTPUT_CSV = _config.get("output_csv", _mstr_section.get("output_csv", "data_dictionary.csv"))
-
-# Env var override: comma-separated list, e.g. "ITT GBQ,aehrlich_pg_db"
-_env_models = [m.strip() for m in _env("MOSAIC_MODELS", "").split(",") if m.strip()]
-if _env_models:
-    MOSAIC_MODELS = _env_models
-
-
-# ---------------------------------------------------------------------------
-# CONNECTION
-# ---------------------------------------------------------------------------
-
-def connect() -> connection.Connection:
-    """Establish a MicroStrategy connection."""
-    print(f"Connecting to {MSTR_BASE_URL} as {MSTR_USERNAME}...")
-    conn = connection.Connection(
-        base_url=MSTR_BASE_URL,
-        username=MSTR_USERNAME,
-        password=MSTR_PASSWORD,
-        project_name=MSTR_PROJECT_NAME,
-        login_mode=MSTR_LOGIN_MODE,
-    )
-    print(f"Connected. I-Server version: {conn.iserver_version}")
-    return conn
-
-
-# ---------------------------------------------------------------------------
-# FETCHERS
-# ---------------------------------------------------------------------------
-
 def _normalize_type(dtype: str) -> str:
-    """Normalize a data type string to a short canonical form for comparison.
-    Handles dict-style representations from MicroStrategy and plain strings
-    from BigQuery INFORMATION_SCHEMA."""
-    import re
+    """Normalize a data type string to a short canonical form for comparison."""
     dtype = dtype.upper().strip()
-    # If it's a dict-like string (e.g. "{'type': 'int64', ...}"), extract the 'type' field
     m = re.search(r"'type'\s*:\s*'([^']*)'", dtype, re.IGNORECASE)
     if m:
         dtype = m.group(1).upper()
     else:
         dtype = dtype.upper()
 
-    # Normalize semantically equivalent types between Mosaic and BigQuery
     TYPE_ALIASES = {
-        # Mosaic string types → canonical VARCHAR
         'FIXED_LENGTH_STRING': 'VARCHAR',
         'LONG_VARCHAR':        'VARCHAR',
         'TEXT':                'VARCHAR',
         'WIDE_CHAR':           'VARCHAR',
+        'VARIABLE_LENGTH_STRING': 'VARCHAR',
+        'UTF8_CHAR':           'VARCHAR',
         'CHAR':                'CHAR',
         'VARCHAR':             'VARCHAR',
-        # BigQuery string type → canonical VARCHAR
         'STRING':              'VARCHAR',
-        # Numeric types
         'NUMERIC':             'DECIMAL',
         'DECIMAL':             'DECIMAL',
-        'FLOAT':               'FLOAT',
+        'FLOAT':               'DOUBLE',
         'DOUBLE':              'DOUBLE',
+        'DOUBLE PRECISION':    'DOUBLE',
         'REAL':                'FLOAT',
-        # Integer types (all map to BIGINT for cross-DB consistency)
         'INT':                 'BIGINT',
         'INTEGER':             'BIGINT',
         'INT64':               'BIGINT',
@@ -154,16 +78,15 @@ def _normalize_type(dtype: str) -> str:
         'SMALLINT':            'SMALLINT',
         'TINYINT':             'TINYINT',
         'BIGINT':              'BIGINT',
-        # Boolean types
         'BOOL':                'BOOLEAN',
         'BOOLEAN':             'BOOLEAN',
         'BIT':                 'BOOLEAN',
-        # Date/time types
         'DATE':                'DATE',
-        'DATETIME':            'DATETIME',
+        'DATETIME':            'TIMESTAMP',
         'TIMESTAMP':           'TIMESTAMP',
         'TIME':                'TIME',
-        # BigQuery array types - normalize to ARRAY
+        'TIME_STAMP':          'TIMESTAMP',
+        'TIMESTAMP WITHOUT TIME ZONE': 'TIMESTAMP',
         re.compile(r'^ARRAY<.*>$'): 'ARRAY',
     }
     for key, val in TYPE_ALIASES.items():
@@ -172,188 +95,143 @@ def _normalize_type(dtype: str) -> str:
     return TYPE_ALIASES.get(dtype, dtype)
 
 
-def _filter_tables(tables: list[dict], model_filter: list[str]) -> list[dict]:
-    if model_filter:
-        return [
-            t for t in tables
-            if t.get("name", "").upper() in [m.upper() for m in model_filter]
-        ]
-    return tables
+def _resolve_datasource_id(conn: connection.Connection, name: str) -> str | None:
+    """Resolve a datasource display name to its ID via server-wide /api/datasources."""
+    r = conn.get(endpoint="/api/datasources")
+    if not r.ok:
+        return None
+    ds_list = r.json().get("datasources", [])
+    name_lower = name.lower()
+    for ds in ds_list:
+        if ds.get("name", "").lower() == name_lower:
+            return ds["id"]
+    for ds in ds_list:
+        if name_lower in ds.get("name", "").lower():
+            return ds["id"]
+    return None
 
 
-def fetch_warehouse_tables(
-    conn: connection.Connection,
-    ds_map: dict[str, str],
-) -> list[dict[str, Any]]:
-    print("\nFetching warehouse tables from MicroStrategy...")
-    all_rows = []
-
-    for model_name, ds_id in ds_map.items():
-        try:
-            namespaces = list_namespaces(conn, id=ds_id)
-        except Exception as e:
-            print(f"  Warning: could not list namespaces for '{model_name}': {e}")
-            continue
-
-        for ns in namespaces:
-            try:
-                tables = list_datasource_warehouse_tables(
-                    conn,
-                    datasource_id=ds_id,
-                    namespace_id=ns["id"],
-                )
-            except Exception as e:
-                print(f"  Warning: could not list tables in namespace '{ns['name']}' ({model_name}): {e}")
-                continue
-
-            for tbl in tables:
-                col_rows = [
-                    {
-                        "mosaic_column_name": c.get("name", ""),
-                        "mosaic_column_id":   c.get("id", "") or "",
-                        "mosaic_data_type":   str(c.get("data_type", "")),
-                        "mosaic_description": "",
-                    }
-                    for c in tbl.list_columns(to_dictionary=True)
-                ]
-                all_rows.append({
-                    "mosaic_table_name":  tbl.name,
-                    "datasource_id":     ds_id,
-                    "datasource_name":   model_name.capitalize(), # Simplified representation
-                    "namespace":         ns["name"],
-                    "columns":           col_rows,
-                })
-
-    table_count = len(all_rows)
-    print(f"  Found {table_count} warehouse table(s).")
-    return all_rows
+def _get_db_type(conn: connection.Connection, ds_id: str) -> str:
+    """Detect whether datasource is postgres, mssql, bigquery, etc."""
+    r = conn.get(endpoint="/api/datasources")
+    if r.ok:
+        for ds in r.json().get("datasources", []):
+            if ds.get("id") == ds_id:
+                return ds.get("database", {}).get("type", "").lower()
+    return "unknown"
 
 
-def fetch_physical_tables(
-    conn: connection.Connection,
-    model_filter: list[str],
-) -> list[dict[str, Any]]:
-    print("\nFetching physical tables from MicroStrategy...")
-    tables = list_physical_tables(conn, to_dictionary=True, include_unassigned_tables=True)
-    tables = _filter_tables(tables, model_filter)
-    print(f"  Found {len(tables)} physical table(s).")
+def _extract_pipeline_ds_info(physical_table: dict) -> dict:
+    """Extract dataSourceId, namespace, tableName from the pipeline JSON."""
+    pipeline_str = physical_table.get("pipeline", "{}")
+    try:
+        pipeline = json.loads(pipeline_str) if isinstance(pipeline_str, str) else pipeline_str
+    except Exception:
+        return {}
+    for child in pipeline.get("rootTable", {}).get("children", []):
+        src = child.get("importSource", {})
+        if src:
+            return {
+                "datasource_id": src.get("dataSourceId", ""),
+                "namespace": src.get("namespace", ""),
+                "table_name": src.get("tableName", ""),
+            }
+    return {}
 
-    rows = []
+
+# ---------------------------------------------------------------------------
+# FETCHERS
+# ---------------------------------------------------------------------------
+
+def fetch_model_columns(conn: connection.Connection, model_id: str) -> list[dict]:
+    """Pull column definitions directly from the Mosaic model's physical tables."""
+    print("\nFetching model column definitions...")
+    r = conn.get(
+        endpoint=f"/api/model/dataModels/{model_id}/tables",
+        params={"fields": "information,physicalTable", "limit": 100},
+    )
+    if not r.ok:
+        raise RuntimeError(f"Failed to fetch model tables: {r.text[:500]}")
+
+    tables = r.json().get("tables", [])
+    all_columns = []
+
     for tbl in tables:
-        col_rows = [
-            {
-                "phys_column_name":  c.get("name", ""),
-                "phys_column_id":    c.get("id", ""),
-                "phys_data_type":    c.get("data_type") or c.get("sub_type", ""),
-                "phys_ext_type":     c.get("ext_type", ""),
-                "phys_description":  c.get("description", ""),
-            }
-            for col in (tbl.get("columns") or [])
-            for c in ([col] if isinstance(col, dict) else [])
-        ]
-        rows.append({
-            "phys_table_name": tbl.get("name", ""),
-            "phys_ext_type":  tbl.get("ext_type", ""),
-            "phys_id":        tbl.get("id", ""),
-            "columns":        col_rows,
-        })
-    return rows
+        info = tbl.get("information", {})
+        pt = tbl.get("physicalTable", {})
+        tname = info.get("name", "")
+
+        cols = pt.get("columns", [])
+        for col in cols:
+            cinfo = col.get("information", {})
+            ctype = col.get("dataType", {})
+            stype = col.get("sourceDataType", {})
+
+            if isinstance(ctype, dict):
+                data_type = ctype.get("type", "")
+            elif isinstance(ctype, str):
+                data_type = ctype
+            else:
+                data_type = ""
+
+            all_columns.append({
+                "model_table": tname,
+                "column_name": cinfo.get("name", ""),
+                "column_id":   cinfo.get("objectId", ""),
+                "data_type":   data_type,
+            })
+        print(f"  {tname}: {len(cols)} columns")
+
+    print(f"  Total: {len(all_columns)} model columns")
+    return all_columns
 
 
-def fetch_logical_tables(
+def fetch_physical_columns(
     conn: connection.Connection,
-    model_filter: list[str],
-) -> list[dict[str, Any]]:
-    print("\nFetching logical tables...")
-    tables = list_logical_tables(conn, to_dictionary=True)
-    tables = _filter_tables(tables, model_filter)
-    print(f"  Found {len(tables)} logical table(s).")
-    return tables
+    ds_name: str,
+    table_name: str,
+    schema_name: str = "public",
+) -> list[dict]:
+    """Query a physical datasource via INFORMATION_SCHEMA."""
+    ds_id = _resolve_datasource_id(conn, ds_name)
+    if not ds_id:
+        print(f"  ERROR: Datasource \"{ds_name}\" not found")
+        return []
 
+    db_type = _get_db_type(conn, ds_id)
+    fq_table = "INFORMATION_SCHEMA.COLUMNS"
 
-def fetch_physical_schema(
-    conn: connection.Connection,
-    mosaic_data: list[dict[str, Any]],
-    ds_map: dict[str, str],
-) -> list[dict[str, Any]]:
-    """Query the actual data source (via DatasourceInstance.execute_query)
-    to get physical column metadata from INFORMATION_SCHEMA."""
-    print("\nQuerying physical schema from data source(s)...")
+    if "sql_server" in db_type or "mssql" in db_type:
+        query = f"SELECT COLUMN_NAME AS column_name, DATA_TYPE AS data_type FROM {fq_table} WHERE TABLE_NAME='{table_name}' ORDER BY ORDINAL_POSITION"
+    else:
+        query = f"SELECT column_name, data_type FROM {fq_table} WHERE table_name='{table_name}' ORDER BY ordinal_position"
 
-    from mstrio.datasources import DatasourceInstance
+    print(f"  Querying \"{ds_name}\" ({ds_id[:12]}...) for {schema_name}.{table_name}...")
+    try:
+        ds_obj = DatasourceInstance(connection=conn, id=ds_id)
+        result = ds_obj.execute_query(project_id=conn.project_id, query=query)
+    except Exception as e:
+        print(f"  ERROR: query failed: {e}")
+        return []
 
-    all_rows = []
-    for tbl in mosaic_data:
-        ds_name = tbl.get("datasource_name", "").upper()
-        ns = tbl.get("namespace", "")
-        table_name = tbl.get("mosaic_table_name", "")
+    data = result.get("results", {}).get("data", {})
+    if not data:
+        print(f"  Warning: no data returned")
+        return []
 
-        ds_id = ds_map.get(ds_name)
-        if not ds_id:
-            continue
+    col_names = data.get("column_name", [])
+    col_types = data.get("data_type", [])
 
-        proj_id = conn.project_id
-
-        # Resolve DB type to determine INFORMATION_SCHEMA path
-        try:
-            ds_list = list_connected_datasource_instances(conn, to_dictionary=True)
-            ds_meta = next((d for d in ds_list if d["id"] == ds_id), {})
-            db_type = ds_meta.get("database_type", "").lower()
-        except Exception:
-            db_type = "unknown"
-
-        # BigQuery uses dataset.INFORMATION_SCHEMA.COLUMNS syntax
-        if "bigquery" in db_type:
-            fq_table = f"`{ns}`.INFORMATION_SCHEMA.COLUMNS"
-        else:
-            fq_table = "INFORMATION_SCHEMA.COLUMNS"
-
-        try:
-            ds_obj = DatasourceInstance(connection=conn, id=ds_id)
-            result = ds_obj.execute_query(
-                project_id=proj_id,
-                query=f"""
-                    SELECT column_name, data_type, is_nullable
-                    FROM {fq_table}
-                    WHERE table_name = '{table_name}'
-                    ORDER BY ordinal_position
-                """,
-            )
-        except Exception as e:
-            print(f"  Warning: query failed for '{ds_name}.{ns}.{table_name}': {e}")
-            continue
-
-        results = result.get("results", {})
-        data = results.get("data", {})
-        if not data:
-            continue
-
-        col_names = data.get("column_name", [])
-        col_types = data.get("data_type", [])
-
-        col_rows = [
-            {
-                "phys_column_name": col_names[i] if i < len(col_names) else "",
-                "phys_column_id":   "",
-                "phys_data_type":   col_types[i] if i < len(col_types) else "",
-                "phys_ext_type":    "",
-                "phys_description": "",
-            }
-            for i in range(len(col_names))
-        ]
-
-        all_rows.append({
-            "phys_table_name": table_name,
-            "phys_ext_type":   "",
-            "phys_id":         "",
-            "columns":         col_rows,
+    columns = []
+    for i in range(len(col_names)):
+        columns.append({
+            "table_name": table_name,
             "datasource_name": ds_name,
-            "namespace":       ns,
+            "column_name": col_names[i],
+            "data_type": col_types[i] if i < len(col_types) else "",
         })
-
-    total_cols = sum(len(r["columns"]) for r in all_rows)
-    print(f"  Fetched physical schema for {len(all_rows)} table(s) ({total_cols} columns).")
-    return all_rows
+    print(f"  Found {len(columns)} physical columns")
+    return columns
 
 
 # ---------------------------------------------------------------------------
@@ -361,55 +239,58 @@ def fetch_physical_schema(
 # ---------------------------------------------------------------------------
 
 def build_dictionary(
-    mosaic_data: list[dict[str, Any]],
-    phys_data: list[dict[str, Any]],
-    log_data: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    phys_by_name = {t["phys_table_name"].upper(): t for t in phys_data}
-    log_by_name = {t.get("name", "").upper(): t for t in log_data}
-    dictionary: list[dict[str, Any]] = []
+    model_columns: list[dict],
+    phys_columns: list[dict],
+) -> list[dict]:
+    """Cross-reference model and physical columns, normalizing types."""
+    # Index physical by (table_upper, column_upper)
+    phys_index = {}
+    for pc in phys_columns:
+        key = (pc["table_name"].upper(), pc["column_name"].upper())
+        phys_index[key] = pc
 
-    for mosaic_tbl in mosaic_data:
-        mosaic_name = mosaic_tbl["mosaic_table_name"].upper()
-        phys_tbl = phys_by_name.get(mosaic_name)
+    model_tables = set(mc["model_table"].upper() for mc in model_columns)
+    dictionary = []
 
-        mosaic_cols = {c["mosaic_column_name"].upper(): c for c in mosaic_tbl["columns"]}
-        phys_cols = {
-            c["phys_column_name"].upper(): c
-            for c in (phys_tbl["columns"] if phys_tbl else [])
-        }
+    for mc in model_columns:
+        key = (mc["model_table"].upper(), mc["column_name"].upper())
+        pc = phys_index.get(key)
 
-        for col_name in sorted(set(mosaic_cols) | set(phys_cols)):
-            mosaic_col = mosaic_cols.get(col_name, {})
-            phys_col = phys_cols.get(col_name, {})
-            mosaic_dtype = _normalize_type(mosaic_col.get("mosaic_data_type", ""))
-            phys_dtype = _normalize_type(phys_col.get("phys_data_type", "") or phys_col.get("phys_ext_type", ""))
+        model_dtype = _normalize_type(mc["data_type"])
+        phys_dtype  = _normalize_type(pc["data_type"]) if pc else ""
 
-            if not mosaic_col and phys_col:
-                status = "IN_PHYSICAL_ONLY"
-            elif mosaic_col and not phys_col:
-                status = "IN_MOSAIC_ONLY"
-            elif mosaic_dtype.upper() != phys_dtype.upper():
-                status = "TYPE_MISMATCH"
-            else:
-                status = "MATCH"
+        if pc is None:
+            status = "IN_MOSAIC_ONLY"
+        elif model_dtype != phys_dtype:
+            status = "TYPE_MISMATCH"
+        else:
+            status = "MATCH"
 
-            dictionary.append({
-                "mosaic_table":           mosaic_tbl["mosaic_table_name"],
-                "datasource_name":        mosaic_tbl["datasource_name"],
-                "namespace":             mosaic_tbl["namespace"],
-                "logical_table":          log_by_name.get(mosaic_name, {}).get("name", ""),
-                "physical_table":        phys_tbl["phys_table_name"] if phys_tbl else "",
-                "phys_ext_type":          phys_tbl["phys_ext_type"] if phys_tbl else "",
-                "column_name":           (mosaic_col.get("mosaic_column_name") or phys_col.get("phys_column_name", "")),
-                "mosaic_column_id":       mosaic_col.get("mosaic_column_id", ""),
-                "phys_column_id":        phys_col.get("phys_column_id", ""),
-                "mosaic_data_type":      mosaic_dtype,
-                "physical_data_type":    phys_dtype,
-                "mosaic_description":    mosaic_col.get("mosaic_description", ""),
-                "physical_description":  phys_col.get("phys_description", ""),
-                "match_status":          status,
-            })
+        dictionary.append({
+            "mosaic_table":      mc["model_table"],
+            "datasource_name":   pc["datasource_name"] if pc else "",
+            "column_name":       mc["column_name"],
+            "mosaic_data_type":  model_dtype,
+            "physical_data_type": phys_dtype,
+            "match_status":      status,
+        })
+
+    # Catch physical-only columns (exist in DB but not in model)
+    for key, pc in phys_index.items():
+        if key[0] in model_tables:
+            if not any(
+                mc["model_table"].upper() == key[0] and mc["column_name"].upper() == key[1]
+                for mc in model_columns
+            ):
+                dictionary.append({
+                    "mosaic_table":      key[0],
+                    "datasource_name":   pc["datasource_name"],
+                    "column_name":       pc["column_name"],
+                    "mosaic_data_type":  "",
+                    "physical_data_type": _normalize_type(pc["data_type"]),
+                    "match_status":      "IN_PHYSICAL_ONLY",
+                })
+
     return dictionary
 
 
@@ -417,24 +298,16 @@ def build_dictionary(
 # OUTPUT
 # ---------------------------------------------------------------------------
 
-def write_csv(rows: list[dict[str, Any]], path: str) -> None:
+def write_csv(rows: list[dict], path: str) -> None:
     if not rows:
         print("No rows to write.")
         return
-
-    fieldnames = [
-        "mosaic_table", "datasource_name", "namespace",
-        "logical_table", "physical_table", "phys_ext_type",
-        "column_name", "mosaic_column_id", "phys_column_id",
-        "mosaic_data_type", "physical_data_type",
-        "mosaic_description", "physical_description", "match_status",
-    ]
-
+    fieldnames = ["mosaic_table", "datasource_name", "column_name",
+                  "mosaic_data_type", "physical_data_type", "match_status"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-
     print(f"\nData dictionary written to: {path}")
     print(f"  Total rows: {len(rows)}")
 
@@ -444,32 +317,95 @@ def write_csv(rows: list[dict[str, Any]], path: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Compare a Mosaic model against its physical data sources"
+    )
+    parser.add_argument("--model-id", "-m", required=True,
+                        help="MicroStrategy Mosaic model ID")
+    parser.add_argument("--datasource", "-d", action="append", default=None,
+                        help="Datasource display name (paired with --table)")
+    parser.add_argument("--table", "-t", action="append", default=None,
+                        help="Table name (paired with --datasource)")
+    parser.add_argument("--schema", "-s", action="append", default=None,
+                        help="Schema/namespace name (default: public)")
+    parser.add_argument("--output", "-o", default=None,
+                        help="Output CSV path (default: data_dictionary.csv)")
+
+    args = parser.parse_args()
+
+    MSTR_BASE_URL = _env("MSTR_BASE_URL")
+    MSTR_USERNAME = _env("MSTR_USERNAME")
+    MSTR_PASSWORD = _env("MSTR_PASSWORD")
+    MSTR_PROJECT_NAME = _env("MSTR_PROJECT_NAME", "Shared Studio")
+    MSTR_LOGIN_MODE = int(_env("MSTR_LOGIN_MODE", "1"))
+
+    output_csv = args.output or "data_dictionary.csv"
+
     print("=" * 60)
     print("MicroStrategy Data Dictionary Generator")
     print("=" * 60)
-    print(f"  Base URL : {MSTR_BASE_URL}")
-    print(f"  Username : {MSTR_USERNAME}")
-    print(f"  Project  : {MSTR_PROJECT_NAME}")
-    print(f"  Models    : {MOSAIC_MODELS or '(all)'}")
-    print(f"  Output   : {OUTPUT_CSV}")
+    print(f"  Model ID  : {args.model_id}")
+    print(f"  Output    : {output_csv}")
     print()
 
-    conn = connect()
+    conn = connection.Connection(
+        base_url=MSTR_BASE_URL,
+        username=MSTR_USERNAME,
+        password=MSTR_PASSWORD,
+        project_name=MSTR_PROJECT_NAME,
+        login_mode=MSTR_LOGIN_MODE,
+    )
+    print(f"Connected. I-Server version: {conn.iserver_version}")
 
-    # Map requested models to DS IDs
-    ds_map = _get_model_to_ds_map(conn, MOSAIC_MODELS)
+    # Fetch model columns
+    model_columns = fetch_model_columns(conn, args.model_id)
 
-    if not ds_map and MOSAIC_MODELS:
-        print(f"Error: None of the requested models {MOSAIC_MODELS} were found in the project.")
-        conn.close()
-        return
+    # Fetch physical columns
+    phys_columns = []
+    if args.datasource:
+        ds_names = args.datasource
+        table_list = args.table or []
+        schema_list = args.schema or []
+        while len(table_list) < len(ds_names):
+            table_list.append("")
+        while len(schema_list) < len(ds_names):
+            schema_list.append("public")
 
-    mosaic_data = fetch_warehouse_tables(conn, ds_map)
-    phys_data   = fetch_physical_schema(conn, mosaic_data, ds_map)
-    log_data    = fetch_logical_tables(conn, MOSAIC_MODELS)
+        print(f"\nQuerying physical data sources ({len(ds_names)} target(s))...")
+        for i in range(len(ds_names)):
+            if table_list[i]:
+                cols = fetch_physical_columns(conn, ds_names[i], table_list[i], schema_list[i])
+                phys_columns.extend(cols)
+    else:
+        # Auto-discover from pipeline metadata
+        print("\nAuto-discovering datasources from model pipeline metadata...")
+        r = conn.get(
+            endpoint=f"/api/model/dataModels/{args.model_id}/tables",
+            params={"fields": "information,physicalTable", "limit": 100},
+        )
+        if r.ok:
+            for tbl in r.json().get("tables", []):
+                info = tbl.get("information", {})
+                pt = tbl.get("physicalTable", {})
+                ds_info = _extract_pipeline_ds_info(pt)
+                if ds_info.get("datasource_id"):
+                    # Resolve datasource name
+                    ds_name = ds_info["datasource_id"]
+                    dsr = conn.get(endpoint="/api/datasources")
+                    if dsr.ok:
+                        for d in dsr.json().get("datasources", []):
+                            if d.get("id") == ds_info["datasource_id"]:
+                                ds_name = d.get("name", ds_info["datasource_id"])
+                                break
+                    cols = fetch_physical_columns(
+                        conn, ds_name,
+                        ds_info.get("table_name", info.get("name", "")),
+                        ds_info.get("namespace", "public"),
+                    )
+                    phys_columns.extend(cols)
 
     print("\nBuilding data dictionary...")
-    dictionary = build_dictionary(mosaic_data, phys_data, log_data)
+    dictionary = build_dictionary(model_columns, phys_columns)
 
     counts = {
         "MATCH": sum(1 for r in dictionary if r["match_status"] == "MATCH"),
@@ -477,13 +413,12 @@ def main() -> None:
         "IN_MOSAIC_ONLY": sum(1 for r in dictionary if r["match_status"] == "IN_MOSAIC_ONLY"),
         "IN_PHYSICAL_ONLY": sum(1 for r in dictionary if r["match_status"] == "IN_PHYSICAL_ONLY"),
     }
-
     print(f"\nSummary:")
     for k, v in counts.items():
         print(f"  {k:18s}: {v}")
     print(f"  {'Total columns':18s}: {len(dictionary)}")
 
-    write_csv(dictionary, OUTPUT_CSV)
+    write_csv(dictionary, output_csv)
     conn.close()
     print("Done.")
 

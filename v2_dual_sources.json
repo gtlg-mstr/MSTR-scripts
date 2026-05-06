@@ -1,0 +1,12 @@
+[
+  {
+    "datasource": "glagrange - Postgresql",
+    "schema": "public",
+    "table": "LRX_pg_orders"
+  },
+  {
+    "datasource": "glagrange - MicroSoft SQL",
+    "schema": "dbo",
+    "table": "LRX_mssql_rx"
+  }
+]

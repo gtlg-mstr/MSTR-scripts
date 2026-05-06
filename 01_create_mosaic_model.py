@@ -5,6 +5,11 @@
 Create a Mosaic data model from multiple database tables across different datasources.
 
 Usage (single source - backward compatible):
+
+**DEPRECATED**: This file is an outdated copy. Please use the latest version:
+`create_mosaic_model_v2.py`
+
+
     python create_mosaic_model_v2.py \
         --datasource "glagrange - Postgresql" \
         --table GRASP_expense_analysis \

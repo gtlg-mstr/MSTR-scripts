@@ -4,6 +4,7 @@
 
 # HAR captures (network logs with auth tokens)
 har-captures/
+ITT/
 
 # Archive folder
 archive/
